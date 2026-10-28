@@ -2,10 +2,12 @@
 
 One row per completed optimizer step is appended to metrics.jsonl. Rows are held in memory and
 written to disk whenever `step % flush_every == 0` (default 10), so a crash loses at most the last 9 steps.
-A row with a non-finite value is flushed at once, because that is the row you want to see after a crash.
+A row with a non-finite value (stored as "nan", "inf" or "-inf") is flushed at once, because that is
+the row you want to see after a crash.
 
 Only metrics from the metric list are written; an unknown name (a typo, or a dropped metric such as
-`loss` or `loss_by_lane`) is skipped without an error. `gpu_alloc_gb` (the name train.py uses; the value is GiB) is mapped to `gpu_alloc_gib`. The 10-second system metrics from G6 (`gpu_utilization`,
+`loss` or `loss_by_lane`) is skipped with one warning per name. `gpu_alloc_gb` (the name train.py uses; the value is GiB) is
+mapped to `gpu_alloc_gib`. The 10-second system metrics from G6 (`gpu_utilization`,
 `gpu_memory_used`) have no step, so they are not written here.
 
     with MetricsWriter("metrics.jsonl") as writer:
@@ -17,6 +19,7 @@ Only metrics from the metric list are written; an unknown name (a typo, or a dro
 import json
 import math
 import os
+import sys
 import time
 
 FLUSH_EVERY = 10
@@ -34,9 +37,15 @@ ALIASES = {"gpu_alloc_gb": "gpu_alloc_gib"}
 
 
 def _clean(value):
-    """Return (value with non-finite floats replaced by None, whether any were found)."""
+    """Return (JSON-safe value, whether any non-finite number was found).
+
+    NumPy and torch scalars become Python numbers. NaN and Inf are stored as the strings
+    "nan", "inf" and "-inf", so the monitor can tell a NaN loss from an overflow.
+    """
+    if hasattr(value, "tolist"):  # numpy scalar/array, torch tensor
+        value = value.tolist()
     if isinstance(value, float):
-        return (value, False) if math.isfinite(value) else (None, True)
+        return (value, False) if math.isfinite(value) else (str(value), True)
     if isinstance(value, (list, tuple)):
         pairs = [_clean(v) for v in value]
         return [v for v, _ in pairs], any(bad for _, bad in pairs)
@@ -53,6 +62,7 @@ class MetricsWriter:
         self.path = path
         self.flush_every = flush_every
         self._buffer = []
+        self._warned = set()
         directory = os.path.dirname(os.path.abspath(path))
         os.makedirs(directory, exist_ok=True)
         self._file = open(path, "a", encoding="utf-8")
@@ -63,6 +73,10 @@ class MetricsWriter:
             raise ValueError("write() on a closed MetricsWriter")
         metrics = {ALIASES.get(name, name): value for name, value in metrics.items()}
         # Names outside the metric list are skipped, not written.
+        for name in metrics:
+            if name not in METRICS and name not in self._warned:
+                self._warned.add(name)
+                print(f"metrics_writer: skipping unknown metric {name!r}", file=sys.stderr)
         metrics = {name: value for name, value in metrics.items() if name in METRICS}
         row = {"step": step, "time": time.time()}
         nonfinite = False
